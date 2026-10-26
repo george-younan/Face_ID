@@ -11,7 +11,7 @@ import base64
 import threading
 import time
 from collections import deque
-from flask import Flask, Response, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from faces import FaceRecognition, FACES_DIR
 
@@ -24,16 +24,11 @@ CORS(app, origins=["http://localhost:5173"])
 
 fr = FaceRecognition()
 
-# Global variables with thread safety
-cap = None
+# The browser owns camera capture. Flask only receives frames for processing.
 detecting = False
 current_frame_faces = []
 current_frame_data = []
 frame_lock = threading.Lock()
-last_frame = None
-last_frame_lock = threading.Lock()
-unknown_faces_snapshot = []
-snapshot_lock = threading.Lock()
 
 # Real statistics (all guarded by stats_lock)
 SERVER_START = time.time()
@@ -42,94 +37,85 @@ frame_times = deque(maxlen=30)  # timestamps of recently processed frames
 known_detections = 0            # face observations matched to a registered person
 unknown_detections = 0          # face observations that matched nobody
 
-def generate_frames():
-    """Generate video frames for streaming"""
-    global cap, detecting, last_frame, known_detections, unknown_detections
-    
-    while True:
-        if detecting and cap is not None:
-            try:
-                success, frame = cap.read()
-                if not success:
-                    # Create a placeholder frame
-                    frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(frame, "Camera Reading Error", (180, 240), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                else:
-                    # Store the latest frame for other threads
-                    with last_frame_lock:
-                        last_frame = frame.copy()
-                    
-                    # Detect and recognize faces
-                    face_locations, names, encodings = fr.detect_and_recognize(frame)
-                    
-                    with frame_lock:
-                        current_frame_faces.clear()
-                        current_frame_data.clear()
-                        
-                        for (top, right, bottom, left), name, encoding in zip(face_locations, names, encodings):
-                            # Draw rectangle and label
-                            color = (0, 0, 255) if name == "Unknown" else (0, 255, 0)
-                            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-                            cv2.putText(frame, name, (left, top - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                            
-                            # Extract face region
-                            face_crop = frame[top:bottom, left:right]
-                            
-                            if name == "Unknown":
-                                if face_crop.size > 0:
-                                    _, buffer = cv2.imencode('.jpg', face_crop)
-                                    current_frame_faces.append({
-                                        "encoding": encoding,
-                                        "image": buffer.tobytes(),
-                                        "location": (top, right, bottom, left)
-                                    })
-                            else:
-                                if face_crop.size > 0:
-                                    _, buffer = cv2.imencode('.jpg', face_crop)
-                                    current_frame_data.append({
-                                        "name": name,
-                                        "image": buffer.tobytes(),
-                                        "extra_data": next((f for f in fr.known_faces_data if f["name"] == name), None)
-                                    })
+def process_camera_frame(frame):
+    """Run recognition on one frame received from the browser."""
+    global known_detections, unknown_detections
 
-                    n_unknown = sum(1 for n in names if n == "Unknown")
-                    with stats_lock:
-                        unknown_detections += n_unknown
-                        known_detections += len(names) - n_unknown
-                        frame_times.append(time.time())
-                
-                # Encode the frame for streaming
-                ret, buffer = cv2.imencode('.jpg', frame)
-                if ret:
-                    frame_bytes = buffer.tobytes()
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                else:
-                    time.sleep(0.1)
-                
-            except Exception as e:
-                print(f"Error in frame generation: {e}")
-                error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(error_frame, "Processing Error", (200, 240), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                _, buffer = cv2.imencode('.jpg', error_frame)
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-                time.sleep(0.1)
-                
+    face_locations, names, encodings = fr.detect_and_recognize(frame)
+    response_faces = []
+    unknown_faces = []
+    known_faces = []
+
+    for (top, right, bottom, left), name, encoding in zip(face_locations, names, encodings):
+        # Clamp coordinates before cropping to avoid invalid NumPy slices.
+        height, width = frame.shape[:2]
+        top, bottom = max(0, top), min(height, bottom)
+        left, right = max(0, left), min(width, right)
+        if bottom <= top or right <= left:
+            continue
+
+        # Crop the face for registration and the detected/known face lists.
+        face_crop = frame[top:bottom, left:right].copy()
+        ok, buffer = cv2.imencode('.jpg', face_crop)
+        if not ok:
+            continue
+        face_image = buffer.tobytes()
+
+        location = [top, right, bottom, left]
+        response_faces.append({"name": name, "location": location})
+
+        if name == "Unknown":
+            unknown_faces.append({
+                "encoding": encoding,
+                "image": face_image,
+                "location": tuple(location),
+            })
         else:
-            # Create a "stopped" frame
-            stopped_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(stopped_frame, "Detection Stopped", (180, 240), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            cv2.putText(stopped_frame, "Click 'Start Detection'", (160, 280), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-            _, buffer = cv2.imencode('.jpg', stopped_frame)
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-            time.sleep(1)
+            known_faces.append({
+                "name": name,
+                "image": face_image,
+                "extra_data": next(
+                    (item for item in fr.known_faces_data if item["name"] == name), None
+                ),
+            })
+
+    # Swap the shared state under a short lock; encoding and recognition happen outside it.
+    with frame_lock:
+        current_frame_faces.clear()
+        current_frame_faces.extend(unknown_faces)
+        current_frame_data.clear()
+        current_frame_data.extend(known_faces)
+
+    unknown_count = sum(1 for face in response_faces if face["name"] == "Unknown")
+    with stats_lock:
+        unknown_detections += unknown_count
+        known_detections += len(response_faces) - unknown_count
+        frame_times.append(time.time())
+
+    return response_faces
+
+
+@app.route('/process_frame', methods=['POST'])
+def process_frame():
+    """Accept one JPEG frame from the browser and return face coordinates."""
+    if not detecting:
+        return jsonify({"success": False, "message": "Detection is not running"}), 409
+
+    if not request.data:
+        return jsonify({"success": False, "message": "Empty frame"}), 400
+
+    try:
+        encoded = np.frombuffer(request.data, dtype=np.uint8)
+        frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        if frame is None:
+            return jsonify({"success": False, "message": "Invalid image frame"}), 400
+
+        faces = process_camera_frame(frame)
+        return jsonify({"success": True, "faces": faces, "width": frame.shape[1], "height": frame.shape[0]})
+    except Exception as exc:
+        app.logger.exception("Failed to process browser camera frame")
+        return jsonify({"success": False, "message": str(exc)}), 500
+
 
 @app.route('/')
 def index():
@@ -137,11 +123,6 @@ def index():
         return ("Frontend not built. Run `pnpm build` in frontend/, "
                 "or use `pnpm dev` and open http://localhost:5173.", 404)
     return send_from_directory(DIST_DIR, "index.html")
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_frames(),
-                   mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/faces_count')
 def faces_count():
@@ -185,74 +166,29 @@ def stats():
 
 @app.route('/toggle_detection', methods=['POST'])
 def toggle_detection():
-    global cap, detecting
-    action = request.json.get("action")
-    
+    """Start/stop recognition; the browser is responsible for camera capture."""
+    global detecting
+    payload = request.get_json(silent=True) or {}
+    action = payload.get("action")
+
     if action == "start":
         if not detecting:
-            try:
-                # Try to open camera
-                cap = cv2.VideoCapture(0)
-                if not cap.isOpened():
-                    cap = cv2.VideoCapture(1)  # Try secondary camera
-                
-                if cap.isOpened():
-                    # Set camera properties
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                    detecting = True
-                    
-                    with stats_lock:
-                        frame_times.clear()
-                    
-                    # Clear previous data
-                    with frame_lock:
-                        current_frame_faces.clear()
-                        current_frame_data.clear()
-                    
-                    return jsonify({
-                        "success": True, 
-                        "status": "started",
-                        "message": "Camera started successfully"
-                    })
-                else:
-                    return jsonify({
-                        "success": False,
-                        "message": "Cannot access camera. Please make sure a webcam is connected and not in use by another application."
-                    })
-                    
-            except Exception as e:
-                return jsonify({
-                    "success": False,
-                    "message": f"Error starting camera: {str(e)}"
-                })
-        else:
-            return jsonify({
-                "success": True,
-                "status": "already_running",
-                "message": "Detection is already running"
-            })
-    
-    elif action == "stop":
+            detecting = True
+            with stats_lock:
+                frame_times.clear()
+            with frame_lock:
+                current_frame_faces.clear()
+                current_frame_data.clear()
+        return jsonify({"success": True, "status": "started", "message": "Face detection started"})
+
+    if action == "stop":
         detecting = False
-        if cap is not None:
-            cap.release()
-            cap = None
-        
         with frame_lock:
             current_frame_faces.clear()
             current_frame_data.clear()
-        
-        return jsonify({
-            "success": True,
-            "status": "stopped",
-            "message": "Detection stopped"
-        })
-    
-    return jsonify({
-        "success": False,
-        "message": "Invalid action"
-    })
+        return jsonify({"success": True, "status": "stopped", "message": "Detection stopped"})
+
+    return jsonify({"success": False, "message": "Invalid action"}), 400
 
 @app.route('/register_face', methods=['POST'])
 def register_face():
@@ -450,49 +386,20 @@ def refresh_faces():
 
 @app.route('/camera_status')
 def camera_status():
-    """Check if camera is available"""
-    try:
-        test_cap = cv2.VideoCapture(0)
-        available = test_cap.isOpened()
-        test_cap.release()
-        return jsonify({
-            "available": available,
-            "detecting": detecting,
-            "message": "Camera available" if available else "No camera detected"
-        })
-    except Exception as e:
-        return jsonify({
-            "available": False,
-            "detecting": detecting,
-            "message": f"Error: {str(e)}"
-        })
+    """Camera devices belong to the browser, not the Flask host."""
+    return jsonify({
+        "available": False,
+        "detecting": detecting,
+        "message": "Select and enable a camera in the browser"
+    })
+
 
 @app.route('/test_camera')
 def test_camera():
-    """Test camera endpoint"""
-    try:
-        test_cap = cv2.VideoCapture(0)
-        if test_cap.isOpened():
-            ret, frame = test_cap.read()
-            test_cap.release()
-            if ret:
-                _, buffer = cv2.imencode('.jpg', frame)
-                img_b64 = base64.b64encode(buffer).decode('utf-8')
-                return jsonify({
-                    "success": True,
-                    "image": img_b64,
-                    "message": "Camera is working"
-                })
-        
-        return jsonify({
-            "success": False,
-            "message": "Camera test failed"
-        })
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "message": str(e)
-        })
+    return jsonify({
+        "success": False,
+        "message": "Camera testing is handled by the browser. Use the camera controls in the UI."
+    }), 400
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)

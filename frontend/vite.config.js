@@ -4,10 +4,10 @@ import tailwindcss from '@tailwindcss/vite'
 
 const backend = 'http://localhost:5000'
 const routes = [
-  '/video_feed', '/faces_count', '/toggle_detection', '/register_face',
+  '/process_frame', '/faces_count', '/toggle_detection', '/register_face',
   '/known_faces_list', '/static_unknown_faces', '/update_unknown_snapshot',
   '/detected_faces', '/refresh_faces', '/camera_status', '/test_camera',
-  '/delete_face',
+  '/delete_face', '/stats',
 ]
 
 // https://vite.dev/config/

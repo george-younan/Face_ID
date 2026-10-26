@@ -21,6 +21,8 @@ const state = reactive({
   statsInterval: null,
   operationInProgress: false,
   cameraAvailable: false,
+  cameraDevices: [],
+  selectedCameraId: '',
   formValues: {},
 })
 
@@ -31,8 +33,14 @@ const ui = reactive({
 })
 
 const videoFeed = ref(null)
+const overlayCanvas = ref(null)
+let cameraStream = null
+let processingLoopRunning = false
 const searchFaces = ref('')
 const toastTimer = ref(null)
+
+// Frames are sent sequentially, so this cap only limits wasted work.
+const TARGET_FRAME_MS = 1000 / 30
 
 const filteredFaces = computed(() => {
   const term = searchFaces.value.toLowerCase().trim()
@@ -116,8 +124,60 @@ function switchToPage(pageId) {
   if (pageId === 'statsPage') loadStatistics()
 }
 
+async function enumerateCameras() {
+  if (!navigator.mediaDevices?.enumerateDevices) return
+  const devices = await navigator.mediaDevices.enumerateDevices()
+  state.cameraDevices = devices.filter(device => device.kind === 'videoinput')
+  if (!state.selectedCameraId && state.cameraDevices.length) {
+    state.selectedCameraId = state.cameraDevices[0].deviceId
+  }
+}
+
+async function enableCamera() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    showToast('Camera access requires HTTPS or localhost and a supported browser.', 'error')
+    return
+  }
+
+  try {
+    const videoConstraint = state.selectedCameraId
+      ? { deviceId: { exact: state.selectedCameraId }, width: { ideal: 640 }, height: { ideal: 480 } }
+      : { width: { ideal: 640 }, height: { ideal: 480 } }
+    const nextStream = await navigator.mediaDevices.getUserMedia({ video: videoConstraint, audio: false })
+
+    if (cameraStream) cameraStream.getTracks().forEach(track => track.stop())
+    cameraStream = nextStream
+    state.cameraAvailable = true
+
+    const track = cameraStream.getVideoTracks()[0]
+    state.selectedCameraId = track?.getSettings().deviceId || state.selectedCameraId
+    if (videoFeed.value) {
+      videoFeed.value.srcObject = cameraStream
+      await videoFeed.value.play()
+    }
+
+    await enumerateCameras()
+    showToast('Camera ready', 'success')
+  } catch (error) {
+    console.error(error)
+    showToast(`Could not access camera: ${error.message}`, 'error')
+  }
+}
+
+async function switchCamera() {
+  if (state.detecting) {
+    showToast('Switching camera...', 'info')
+  }
+  await enableCamera()
+}
+
 async function toggleDetection() {
   if (state.operationInProgress) return
+
+  if (!state.detecting && !cameraStream) {
+    showToast('Enable a camera before starting detection.', 'warning')
+    return
+  }
 
   state.operationInProgress = true
   const action = state.detecting ? 'stop' : 'start'
@@ -128,36 +188,26 @@ async function toggleDetection() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action }),
     })
-
     const data = await response.json()
 
-    if (!data.success) {
+    if (!response.ok || !data.success) {
       showToast(data.message || 'Failed to toggle detection', 'error')
       return
     }
 
-    state.detecting = !state.detecting
+    state.detecting = action === 'start'
 
     if (state.detecting) {
       clearIntervals()
-
       state.updateInterval = setInterval(updateDetectionInfo, 1000)
-
-      if (videoFeed.value) {
-        videoFeed.value.src = `/video_feed?${Date.now()}`
-      }
-
+      processCameraFrames()
       showToast(data.message || 'Face detection started', 'success')
       addActivity('Face detection started')
-
-      if (state.page === 'registerPage') {
-        setTimeout(loadUnknownFacesSnapshot, 1000)
-      }
     } else {
       clearDetectionIntervals()
       state.fps = 0
       state.faceCount = 0
-
+      clearOverlay()
       showToast(data.message || 'Face detection stopped', 'info')
       addActivity('Face detection stopped')
     }
@@ -167,6 +217,95 @@ async function toggleDetection() {
   } finally {
     state.operationInProgress = false
   }
+}
+
+function clearOverlay() {
+  const canvas = overlayCanvas.value
+  if (!canvas) return
+  const context = canvas.getContext('2d')
+  context.clearRect(0, 0, canvas.width, canvas.height)
+}
+
+function drawDetections(faces, sourceWidth, sourceHeight) {
+  const video = videoFeed.value
+  const canvas = overlayCanvas.value
+  if (!video || !canvas || !video.videoWidth || !video.videoHeight) return
+
+  if (canvas.width !== video.videoWidth) canvas.width = video.videoWidth
+  if (canvas.height !== video.videoHeight) canvas.height = video.videoHeight
+  const context = canvas.getContext('2d')
+  context.clearRect(0, 0, canvas.width, canvas.height)
+  const scaleX = canvas.width / sourceWidth
+  const scaleY = canvas.height / sourceHeight
+
+  for (const face of faces) {
+    const [top, right, bottom, left] = face.location
+    const x = left * scaleX
+    const y = top * scaleY
+    const width = (right - left) * scaleX
+    const height = (bottom - top) * scaleY
+    const known = face.name !== 'Unknown'
+    context.strokeStyle = known ? '#22c55e' : '#ef4444'
+    context.lineWidth = Math.max(2, canvas.width / 320)
+    context.strokeRect(x, y, width, height)
+    context.font = `${Math.max(14, canvas.width / 45)}px sans-serif`
+    context.fillStyle = context.strokeStyle
+    context.fillText(face.name, x, Math.max(18, y - 8))
+  }
+}
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function processCameraFrames() {
+  if (processingLoopRunning) return
+  processingLoopRunning = true
+  const captureCanvas = document.createElement('canvas')
+  const context = captureCanvas.getContext('2d', { willReadFrequently: true })
+
+  while (state.detecting && cameraStream) {
+    const frameStarted = performance.now()
+    const video = videoFeed.value
+    if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth) {
+      await wait(100)
+      continue
+    }
+
+    const sourceWidth = Math.min(video.videoWidth, 640)
+    const sourceHeight = Math.round(video.videoHeight * (sourceWidth / video.videoWidth))
+    if (captureCanvas.width !== sourceWidth) captureCanvas.width = sourceWidth
+    if (captureCanvas.height !== sourceHeight) captureCanvas.height = sourceHeight
+    context.drawImage(video, 0, 0, sourceWidth, sourceHeight)
+
+    try {
+      const blob = await new Promise(resolve => captureCanvas.toBlob(resolve, 'image/jpeg', 0.78))
+      if (!blob) {
+        await wait(200)
+        continue
+      }
+      const response = await fetch('/process_frame', {
+        method: 'POST',
+        headers: { 'Content-Type': 'image/jpeg' },
+        body: blob,
+      })
+      if (response.ok) {
+        const result = await response.json()
+        drawDetections(result.faces || [], result.width, result.height)
+      } else if (response.status !== 409) {
+        console.warn('Frame processing failed:', await response.text())
+      }
+    } catch (error) {
+      console.error('Error sending camera frame:', error)
+      await wait(300)
+    }
+
+    // Pace to the target frame time; requests never queue, so slow frames are
+    // sent back to back instead of being dropped by a fixed delay.
+    const remaining = TARGET_FRAME_MS - (performance.now() - frameStarted)
+    if (remaining > 0) await wait(remaining)
+  }
+  processingLoopRunning = false
 }
 
 function clearDetectionIntervals() {
@@ -351,52 +490,8 @@ async function deleteFace(name) {
   }
 }
 
-async function initializeVideoFeed() {
-  try {
-    const response = await fetch('/camera_status')
-    const data = await response.json()
-
-    state.cameraAvailable = data.available
-
-    if (!state.cameraAvailable) {
-      showToast(
-        'Camera not detected. Please connect a webcam and refresh the page.',
-        'warning'
-      )
-      return
-    }
-
-    if (videoFeed.value) {
-      videoFeed.value.src = `/video_feed?${Date.now()}`
-    }
-  } catch (error) {
-    console.error(error)
-    showToast('Error checking camera status', 'error')
-  }
-}
-
 function handleVideoError() {
-  showToast('Video feed error. Trying to reconnect...', 'warning')
-}
-
-async function testCamera() {
-  ui.loading = true
-  ui.loadingMessage = 'Testing camera...'
-
-  try {
-    const response = await fetch('/test_camera')
-    const data = await response.json()
-
-    if (data.success) {
-      showToast('Camera is working!', 'success')
-    } else {
-      showToast(`Camera test failed: ${data.message}`, 'warning')
-    }
-  } catch (error) {
-    showToast(`Camera test error: ${error.message}`, 'error')
-  } finally {
-    ui.loading = false
-  }
+  showToast('Could not display the selected camera.', 'warning')
 }
 
 function handleKeydown(event) {
@@ -410,7 +505,7 @@ function handleKeydown(event) {
 }
 
 onMounted(async () => {
-  await initializeVideoFeed()
+  await enumerateCameras()
   await loadKnownFaces()
   await loadStatistics()
 
@@ -426,6 +521,18 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  if (state.detecting) {
+    fetch('/toggle_detection', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'stop' }),
+      keepalive: true,
+    }).catch(() => {})
+  }
+  state.detecting = false
+  processingLoopRunning = false
+  if (cameraStream) cameraStream.getTracks().forEach(track => track.stop())
+  cameraStream = null
   clearDetectionIntervals()
 
   if (state.knownFacesInterval) {
@@ -504,24 +611,56 @@ onBeforeUnmount(() => {
 
           <div class="mb-8 grid gap-6 xl:grid-cols-[2fr_1fr]">
             <div class="rounded-xl border border-border bg-card-bg p-6">
+              <div class="mb-5 flex flex-col gap-3 sm:flex-row">
+                <label class="flex-1 text-sm font-medium text-text-secondary">
+                  Camera device
+                  <select
+                    v-model="state.selectedCameraId"
+                    class="mt-2 w-full rounded-lg border border-border bg-card-bg px-3 py-3 text-text-primary"
+                    :disabled="state.detecting || !state.cameraDevices.length"
+                    @change="switchCamera"
+                  >
+                    <option v-for="camera in state.cameraDevices" :key="camera.deviceId" :value="camera.deviceId">
+                      {{ camera.label || `Camera ${state.cameraDevices.indexOf(camera) + 1}` }}
+                    </option>
+                  </select>
+                </label>
+                <div class="flex items-end">
+                  <button
+                    class="w-full rounded-lg border border-border px-5 py-3 font-semibold transition hover:bg-primary/10 sm:w-auto"
+                    :disabled="state.operationInProgress"
+                    @click="enableCamera"
+                  >
+                    <i class="fas fa-camera mr-2"></i>
+                    {{ state.cameraAvailable ? 'Reconnect Camera' : 'Enable Camera' }}
+                  </button>
+                </div>
+              </div>
               <div
                 class="relative mb-6 aspect-[4/3] overflow-hidden rounded-lg bg-black"
               >
-                <img
+                <video
                   ref="videoFeed"
-                  src=""
-                  alt="Camera Feed"
+                  autoplay
+                  muted
+                  playsinline
+                  aria-label="Selected camera preview"
                   class="h-full w-full object-cover"
                   @error="handleVideoError"
-                />
+                ></video>
+                <canvas
+                  ref="overlayCanvas"
+                  class="pointer-events-none absolute inset-0 h-full w-full object-cover"
+                  aria-hidden="true"
+                ></canvas>
 
                 <div
-                  class="absolute inset-0 flex items-center justify-center bg-black/70 transition-opacity"
-                  :class="state.detecting ? 'pointer-events-none opacity-0' : 'opacity-100'"
+                  v-if="!state.cameraAvailable"
+                  class="absolute inset-0 flex items-center justify-center bg-black/70"
                 >
                   <div class="flex items-center gap-3 rounded-lg bg-black/80 px-6 py-4 text-lg">
                     <i class="fas fa-video-slash"></i>
-                    Detection Stopped
+                    Enable a camera to begin
                   </div>
                 </div>
               </div>

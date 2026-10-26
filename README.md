@@ -18,7 +18,7 @@ A real-time face recognition web app. It reads a live webcam feed, identifies pe
 
 1. The backend opens the camera (index 0, falling back to 1) at 640x480.
 2. Each frame is downscaled to 50% and run through the HOG face detector.
-3. Every detected face gets a 128-d encoding. It is matched to the closest registered encoding, and counts as a match if the distance is below `0.5`. Otherwise the face is labelled "Unknown".
+3. Detected faces get a 128-d encoding, which is matched to the closest registered encoding and counts as a match if the distance is below `0.5`. Otherwise the face is labelled "Unknown". Encodings are cached per face and refreshed roughly twice a second instead of on every frame.
 4. Annotated frames are streamed to the browser as MJPEG (`/video_feed`). The Vue app polls small JSON endpoints for counts, FPS, faces and stats.
 5. Registered faces are saved in `faces/data.json` (encodings and metadata) alongside the face images in `faces/`.
 
@@ -118,6 +118,7 @@ Settings live in the source for now:
 |---|---|---|
 | Match distance threshold | `backend/src/faces.py` | `0.5` (lower is stricter) |
 | Detection model / frame scale | `backend/src/faces.py` | `hog`, 50% |
+| Recognition refresh interval | `backend/src/faces.py` | `0.5` s minimum |
 | Camera resolution | `backend/src/app.py` | 640x480 |
 | Server host/port | `backend/src/app.py` | `0.0.0.0:5000` |
 
